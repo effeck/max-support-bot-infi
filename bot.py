@@ -20,7 +20,7 @@ import logging
 import sys
 from contextlib import suppress
 
-from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ContentType
 from aiogram.filters import Command, CommandStart, StateFilter
