@@ -23,7 +23,7 @@ from contextlib import suppress
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ContentType
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -40,6 +40,11 @@ class UserFlow(StatesGroup):
     waiting_question = State()
     waiting_post_type = State()
     waiting_post_content = State()
+
+
+class AdminFlow(StatesGroup):
+    waiting_reject_reason = State()
+    waiting_comment = State()
 
 
 def main_menu_kb():
@@ -187,8 +192,11 @@ async def on_post(message: Message, state: FSMContext):
     await notify_admin_new(message.bot, ticket_id, is_post=True)
 
 
-@user_router.message()
-async def on_fallback(message: Message):
+@user_router.message(StateFilter(None))
+async def on_fallback(message: Message, state: FSMContext):
+    # If user is in a flow, the state-specific handler will catch it.
+    # Here we only react when no FSM state is set, so admin commands
+    # (/admin, /list, /stats, /ticket) properly fall through to admin_router.
     await message.answer("Выбери действие в меню:", reply_markup=main_menu_kb())
 
 
@@ -278,7 +286,7 @@ async def cmd_ticket(message: Message):
 
 
 @admin_router.callback_query(F.data.startswith("adm:"))
-async def on_adm(cb: CallbackQuery, bot: Bot):
+async def on_adm(cb: CallbackQuery, bot: Bot, state: FSMContext):
     if cb.from_user.id != config.ADMIN_ID:
         await cb.answer("Не для тебя 🙂", show_alert=True); return
     _, action, raw_id = cb.data.split(":")
@@ -294,35 +302,53 @@ async def on_adm(cb: CallbackQuery, bot: Bot):
         await notify_user(bot, ticket, "✅ Твоя заявка принята! Спасибо 🙌")
         await cb.answer("Принято")
     elif action == "reject":
+        await state.set_state(AdminFlow.waiting_reject_reason)
+        await state.update_data(reject_ticket_id=ticket_id, reject_user_id=ticket["user_id"])
         await cb.message.answer(f"Введи причину отказа для #{ticket_id} одним сообщением:")
         await cb.answer()
-        pending = {"expect_from": cb.from_user.id, "action": "reject", "ticket_id": ticket_id}
-
-        @admin_router.message(
-            lambda m: m.from_user.id == pending["expect_from"]
-            and (m.text or "").strip()
-            and not (m.text or "").startswith("/")
-        )
-        async def collect_reason(message: Message):
-            reason = (message.text or "").strip()
-            await db.set_status(pending["ticket_id"], "rejected", reason)
-            await message.answer(f"❌ Отклонено. Причина: {reason}")
-            await notify_user(bot, ticket, f"❌ Твоя заявка #{pending['ticket_id']} отклонена.\nПричина: {reason}")
     elif action == "comment":
+        await state.set_state(AdminFlow.waiting_comment)
+        await state.update_data(comment_ticket_id=ticket_id, comment_user_id=ticket["user_id"])
         await cb.message.answer(f"Введи комментарий / что поправить для #{ticket_id}:")
         await cb.answer()
-        pending = {"expect_from": cb.from_user.id, "action": "comment", "ticket_id": ticket_id}
 
-        @admin_router.message(
-            lambda m: m.from_user.id == pending["expect_from"]
-            and (m.text or "").strip()
-            and not (m.text or "").startswith("/")
-        )
-        async def collect_comment(message: Message):
-            comment = (message.text or "").strip()
-            await db.set_status(pending["ticket_id"], "commented", comment)
-            await message.answer(f"💬 Комментарий отправлен: {comment}")
-            await notify_user(bot, ticket, f"💬 По заявке #{pending['ticket_id']} нужны правки:\n{comment}")
+
+@admin_router.message(AdminFlow.waiting_reject_reason)
+async def collect_reject_reason(message: Message, state: FSMContext):
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    data = await state.get_data()
+    ticket_id = data["reject_ticket_id"]
+    db: Database = message.bot["db"]
+    await db.set_status(ticket_id, "rejected", text)
+    await state.clear()
+    await message.answer(f"❌ Отклонено. Причина: {text}")
+    try:
+        await message.bot.send_message(data["reject_user_id"], f"❌ Твоя заявка #{ticket_id} отклонена.\nПричина: {text}")
+    except Exception:
+        log.exception("Failed to notify user")
+
+
+@admin_router.message(AdminFlow.waiting_comment)
+async def collect_comment_text(message: Message, state: FSMContext):
+    if message.from_user.id != config.ADMIN_ID:
+        return
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    data = await state.get_data()
+    ticket_id = data["comment_ticket_id"]
+    db: Database = message.bot["db"]
+    await db.set_status(ticket_id, "commented", text)
+    await state.clear()
+    await message.answer(f"💬 Комментарий отправлен: {text}")
+    try:
+        await message.bot.send_message(data["comment_user_id"], f"💬 По заявке #{ticket_id} нужны правки:\n{text}")
+    except Exception:
+        log.exception("Failed to notify user")
 
 
 async def main():
